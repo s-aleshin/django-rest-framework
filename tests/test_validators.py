@@ -704,7 +704,7 @@ class TestUniqueConstraintValidation(TestCase):
         # Django 5 includes Max and Min values validators for IntegerField
         extra_validators_qty = 2 if django_version[0] >= 5 else 0
         serializer = UniqueConstraintSerializer()
-        assert len(serializer.validators) == 2
+        assert len(serializer.validators) == 4
         validators = serializer.fields['global_id'].validators
         assert len(validators) == 1 + extra_validators_qty
         assert validators[0].queryset == UniqueConstraintModel.objects

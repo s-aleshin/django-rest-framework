@@ -13,10 +13,12 @@ response content is handled by parsers and renderers.
 
 import contextlib
 import copy
+import dataclasses
 import inspect
 import traceback
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from functools import singledispatch
 
 from django.core.exceptions import FieldDoesNotExist, ImproperlyConfigured
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -888,6 +890,44 @@ def raise_errors_on_nested_writes(method_name, serializer, validated_data):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class UniqueConstraintInfo:
+    fields: list[str]
+    queryset: models.QuerySet
+    condition_fields: list[str] = dataclasses.field(default_factory=list)
+    condition: models.Q | None = None
+    message: str | None = None
+    code: str | None = None
+
+
+@singledispatch
+def normalize_constraint(constraint, model):
+    raise NotImplementedError(f"Unsupported constraint type: {type(constraint)}")
+
+
+@normalize_constraint.register
+def _(constraint: Sequence, model):
+    return UniqueConstraintInfo(fields=list(constraint), queryset=model._default_manager)
+
+
+@normalize_constraint.register
+def _(constraint: models.UniqueConstraint, model):
+    condition_fields = set()
+    if constraint.condition:
+        condition_fields = get_referenced_base_fields_from_q(constraint.condition)
+    # required_fields = set(constraint.fields) | condition_fields
+    if len(set(constraint.fields) | condition_fields) > 1:
+        return UniqueConstraintInfo(
+            fields=constraint.fields,
+            queryset=model._default_manager,
+            condition_fields=condition_fields,
+            condition=constraint.condition,
+            message=getattr(constraint, "violation_error_message", None),
+            code=getattr(constraint, "violation_error_code", None),
+        )
+    return None
+
+
 class ModelSerializer(Serializer):
     """
     A `ModelSerializer` is just a regular `Serializer`, except that:
@@ -1427,20 +1467,32 @@ class ModelSerializer(Serializer):
 
     def get_unique_together_constraints(self, model):
         """
-        Returns iterator of (fields, queryset, condition_fields, condition),
+        Returns iterator of UniqueConstraintData,
         each entry describes an unique together constraint on `fields` in `queryset`
         with respect of constraint's `condition`.
         """
         for parent_class in [model] + list(model._meta.parents):
             for unique_together in parent_class._meta.unique_together:
-                yield unique_together, model._default_manager, [], None
+                yield normalize_constraint(unique_together, model)
+                # yield unique_together, model._default_manager, [], None
             for constraint in parent_class._meta.constraints:
-                if isinstance(constraint, models.UniqueConstraint) and len(constraint.fields) > 1:
-                    if constraint.condition is None:
-                        condition_fields = []
-                    else:
-                        condition_fields = list(get_referenced_base_fields_from_q(constraint.condition))
-                    yield (constraint.fields, model._default_manager, condition_fields, constraint.condition)
+                if result := normalize_constraint(constraint, model):
+                    yield result
+                # if isinstance(constraint, models.UniqueConstraint) and len(constraint.fields) > 1:
+                #     if constraint.condition is None:
+                #         condition_fields = []
+                #     else:
+                #         condition_fields = list(get_referenced_base_fields_from_q(constraint.condition))
+                #     message = getattr(constraint, "violation_error_message", None)
+                #     code = getattr(constraint, "violation_error_code", None)
+                #     yield (
+                #         constraint.fields,
+                #         model._default_manager,
+                #         condition_fields,
+                #         constraint.condition,
+                #         message,
+                #         code
+                #     )
 
     def get_uniqueness_extra_kwargs(self, field_names, declared_fields, extra_kwargs):
         """
@@ -1473,8 +1525,8 @@ class ModelSerializer(Serializer):
 
         # Include each of the `unique_together` and `UniqueConstraint` field names,
         # so long as all the field names are included on the serializer.
-        for unique_together_list, queryset, condition_fields, condition in self.get_unique_together_constraints(model):
-            unique_together_list_and_condition_fields = set(unique_together_list) | set(condition_fields)
+        for unique_constraint_data in self.get_unique_together_constraints(model):
+            unique_together_list_and_condition_fields = set(unique_constraint_data.fields) | set(unique_constraint_data.condition_fields)
             if model_fields_names.issuperset(unique_together_list_and_condition_fields):
                 unique_constraint_names |= unique_together_list_and_condition_fields
 
@@ -1598,13 +1650,14 @@ class ModelSerializer(Serializer):
         # Note that we make sure to check `unique_together` both on the
         # base model class, but also on any parent classes.
         validators = []
-        for unique_together, queryset, condition_fields, condition in self.get_unique_together_constraints(self.Meta.model):
+        # for unique_together, queryset, condition_fields, condition, message, code in self.get_unique_together_constraints(self.Meta.model):
+        for unique_constraint_data in self.get_unique_together_constraints(self.Meta.model):
             # Skip if serializer does not map to all unique together sources
-            unique_together_and_condition_fields = set(unique_together) | set(condition_fields)
-            if not set(source_map).issuperset(unique_together_and_condition_fields):
+            # unique_together_and_condition_fields = set(unique_together) | set(condition_fields)
+            if not set(source_map).issuperset(set(unique_constraint_data.fields) | set(unique_constraint_data.condition_fields)):
                 continue
 
-            for source in unique_together_and_condition_fields:
+            for source in unique_constraint_data.fields:
                 assert len(source_map[source]) == 1, (
                     "Unable to create `UniqueTogetherValidator` for "
                     "`{model}.{field}` as `{serializer}` has multiple "
@@ -1620,12 +1673,14 @@ class ModelSerializer(Serializer):
                     )
                 )
 
-            field_names = tuple(source_map[f][0] for f in unique_together)
+            field_names = tuple(source_map[f][0] for f in unique_constraint_data.fields)
             validator = UniqueTogetherValidator(
-                queryset=queryset,
+                queryset=unique_constraint_data.queryset,
                 fields=field_names,
-                condition_fields=tuple(source_map[f][0] for f in condition_fields),
-                condition=condition,
+                condition_fields=tuple(source_map[f][0] for f in unique_constraint_data.condition_fields),
+                condition=unique_constraint_data.condition,
+                message=unique_constraint_data.message,
+                code=unique_constraint_data.code,
             )
             validators.append(validator)
         return validators

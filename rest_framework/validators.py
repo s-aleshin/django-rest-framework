@@ -110,14 +110,16 @@ class UniqueTogetherValidator:
     """
     message = _('The fields {field_names} must make a unique set.')
     missing_message = _('This field is required.')
+    code = "unique"
     requires_context = True
 
-    def __init__(self, queryset, fields, message=None, condition_fields=None, condition=None):
+    def __init__(self, queryset, fields, message=None, condition_fields=None, condition=None, code=None):
         self.queryset = queryset
         self.fields = fields
         self.message = message or self.message
         self.condition_fields = [] if condition_fields is None else condition_fields
         self.condition = condition
+        self.code = code or self.code
 
     def enforce_required_fields(self, attrs, serializer):
         """
@@ -156,6 +158,8 @@ class UniqueTogetherValidator:
         filter_kwargs = {
             source: attrs[source]
             for source in sources
+            # Exclude condition fields to avoid filtering them by user input; condition is applied separately.
+            # if source not in self.condition_fields
         }
         return qs_filter(queryset, **filter_kwargs)
 
@@ -193,7 +197,7 @@ class UniqueTogetherValidator:
         if checked_values and None not in checked_values and qs_exists_with_condition(queryset, self.condition, condition_kwargs):
             field_names = ', '.join(self.fields)
             message = self.message.format(field_names=field_names)
-            raise ValidationError(message, code='unique')
+            raise ValidationError(message, code=self.code)
 
     def __repr__(self):
         return '<{}({})>'.format(
@@ -212,6 +216,7 @@ class UniqueTogetherValidator:
                 and self.missing_message == other.missing_message
                 and self.queryset == other.queryset
                 and self.fields == other.fields
+                and self.code == other.code
                 )
 
 
